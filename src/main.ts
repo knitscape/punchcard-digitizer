@@ -17,7 +17,8 @@ interface AppState {
   draggingCornerIndex: number | null;
   cellStates: boolean[][];
   showGrid: boolean;
-  detectionThreshold: number; // 0-255, pixels darker than this are considered punches
+  detectionSensitivity: number; // 0-100, how far below local mean a cell must be to count as punched
+  neighborhoodRadius: number; // radius for adaptive threshold window (e.g. 3 means 7x7)
   hoveredCell: { row: number; col: number } | null;
 }
 
@@ -33,7 +34,8 @@ class PunchcardDigitizer {
     draggingCornerIndex: null,
     cellStates: [],
     showGrid: false,
-    detectionThreshold: 128,
+    detectionSensitivity: 30,
+    neighborhoodRadius: 3,
     hoveredCell: null,
   };
 
@@ -530,11 +532,11 @@ class PunchcardDigitizer {
 
     const outW = this.state.outputWidth;
     const outH = this.state.outputHeight;
-    const threshold = this.state.detectionThreshold;
     const samples = 8;
     const invSamples = 1 / samples;
 
-    // Analyze each cell using inlined bilinear interpolation
+    // Pass 1: compute per-cell average lightness
+    const lightness = new Float64Array(outH * outW);
     for (let row = 0; row < outH; row++) {
       for (let col = 0; col < outW; col++) {
         let totalLightness = 0;
@@ -552,7 +554,6 @@ class PunchcardDigitizer {
             const u = (col + (sx + 0.5) * invSamples) / outW;
             const oneMinusU = 1 - u;
 
-            // Map to pixel coords, then offset into the cached selection region
             const px = Math.floor(oneMinusU * leftX + u * rightX) - boundsX;
             const py = Math.floor(oneMinusU * leftY + u * rightY) - boundsY;
 
@@ -564,10 +565,49 @@ class PunchcardDigitizer {
           }
         }
 
-        if (pixelCount > 0) {
-          this.state.cellStates[row][col] =
-            totalLightness / (pixelCount * 3) < threshold;
-        }
+        lightness[row * outW + col] =
+          pixelCount > 0 ? totalLightness / (pixelCount * 3) : 128;
+      }
+    }
+
+    // Build prefix sum table for O(1) local mean queries
+    // prefix[r][c] = sum of lightness for all cells in [0..r-1][0..c-1]
+    const prefix = new Float64Array((outH + 1) * (outW + 1));
+    const pw = outW + 1;
+    for (let r = 1; r <= outH; r++) {
+      for (let c = 1; c <= outW; c++) {
+        prefix[r * pw + c] =
+          lightness[(r - 1) * outW + (c - 1)] +
+          prefix[(r - 1) * pw + c] +
+          prefix[r * pw + (c - 1)] -
+          prefix[(r - 1) * pw + (c - 1)];
+      }
+    }
+
+    // Pass 2: adaptive threshold using local neighborhood mean
+    const radius = this.state.neighborhoodRadius;
+    const sensitivity = this.state.detectionSensitivity;
+
+    for (let row = 0; row < outH; row++) {
+      for (let col = 0; col < outW; col++) {
+        // Clamp window to grid bounds
+        const r1 = Math.max(0, row - radius);
+        const c1 = Math.max(0, col - radius);
+        const r2 = Math.min(outH - 1, row + radius);
+        const c2 = Math.min(outW - 1, col + radius);
+        const count = (r2 - r1 + 1) * (c2 - c1 + 1);
+
+        // Query prefix sum for local region sum
+        const localSum =
+          prefix[(r2 + 1) * pw + (c2 + 1)] -
+          prefix[r1 * pw + (c2 + 1)] -
+          prefix[(r2 + 1) * pw + c1] +
+          prefix[r1 * pw + c1];
+        const localMean = localSum / count;
+
+        // Cell is punched if it's significantly darker than its neighborhood
+        this.state.cellStates[row][col] =
+          lightness[row * outW + col] < localMean - sensitivity;
       }
     }
 
@@ -1354,18 +1394,18 @@ class PunchcardDigitizer {
                             <div>
                               <label
                                 class="block text-xs font-medium text-gray-700 mb-1">
-                                Detection Threshold:
-                                ${this.state.detectionThreshold}
+                                Sensitivity:
+                                ${this.state.detectionSensitivity}
                               </label>
                               <div class="flex items-center gap-2">
-                                <span class="text-xs text-gray-500">Light</span>
+                                <span class="text-xs text-gray-500">Low</span>
                                 <input
                                   type="range"
                                   min="0"
-                                  max="255"
-                                  .value=${this.state.detectionThreshold.toString()}
+                                  max="100"
+                                  .value=${this.state.detectionSensitivity.toString()}
                                   @input=${(e: Event) => {
-                                    this.state.detectionThreshold = parseInt(
+                                    this.state.detectionSensitivity = parseInt(
                                       (e.target as HTMLInputElement).value,
                                     );
                                     // Debounce auto-detect while dragging the slider
@@ -1379,7 +1419,37 @@ class PunchcardDigitizer {
                                       }, 30);
                                   }}
                                   class="flex-1 h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-blue-600" />
-                                <span class="text-xs text-gray-500">Dark</span>
+                                <span class="text-xs text-gray-500">High</span>
+                              </div>
+                            </div>
+                            <div class="mt-1">
+                              <label
+                                class="block text-xs font-medium text-gray-700 mb-1">
+                                Neighborhood:
+                                ${this.state.neighborhoodRadius * 2 + 1}×${this.state.neighborhoodRadius * 2 + 1}
+                              </label>
+                              <div class="flex items-center gap-2">
+                                <span class="text-xs text-gray-500">Local</span>
+                                <input
+                                  type="range"
+                                  min="1"
+                                  max="20"
+                                  .value=${this.state.neighborhoodRadius.toString()}
+                                  @input=${(e: Event) => {
+                                    this.state.neighborhoodRadius = parseInt(
+                                      (e.target as HTMLInputElement).value,
+                                    );
+                                    if (this.thresholdDebounceTimer !== null) {
+                                      clearTimeout(this.thresholdDebounceTimer);
+                                    }
+                                    this.thresholdDebounceTimer =
+                                      window.setTimeout(() => {
+                                        this.thresholdDebounceTimer = null;
+                                        this.autoDetect();
+                                      }, 30);
+                                  }}
+                                  class="flex-1 h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-blue-600" />
+                                <span class="text-xs text-gray-500">Broad</span>
                               </div>
                             </div>
                           `
