@@ -193,10 +193,6 @@ class PunchcardDigitizer {
   private detectedBlobs: DetectedBlob[] = [];
   private rectifiedCellPx = 0;
 
-  // Detected row/column center positions in grid coordinates (from blob clustering)
-  private detectedColPositions: number[] = [];
-  private detectedRowPositions: number[] = [];
-
   // Cached arc-length tables for edge splines (rebuilt when edges change)
   private edgePointArrays: [Corner[], Corner[], Corner[], Corner[]] | null =
     null;
@@ -309,8 +305,6 @@ class PunchcardDigitizer {
         this.state.showGrid = false;
         this.state.cellStates = [];
         this.detectedBlobs = [];
-        this.detectedColPositions = [];
-        this.detectedRowPositions = [];
         this.viewScale = 1;
         this.viewOffsetX = 0;
         this.viewOffsetY = 0;
@@ -447,8 +441,6 @@ class PunchcardDigitizer {
         y: coords.y,
       };
       this.detectedBlobs = [];
-      this.detectedColPositions = [];
-      this.detectedRowPositions = [];
       this.invalidateInputCache();
       this.drawCanvas();
       return;
@@ -465,8 +457,6 @@ class PunchcardDigitizer {
         y: coords.y,
       };
       this.detectedBlobs = [];
-      this.detectedColPositions = [];
-      this.detectedRowPositions = [];
       this.invalidateInputCache();
       this.drawCanvas();
       return;
@@ -1109,196 +1099,8 @@ class PunchcardDigitizer {
     });
   }
 
-  private findPeaks(
-    positions: number[],
-    totalExtent: number,
-    numExpected: number,
-    minSeparation: number,
-  ): number[] {
-    if (positions.length === 0) {
-      const spacing = totalExtent / numExpected;
-      return Array.from({ length: numExpected }, (_, i) => (i + 0.5) * spacing);
-    }
-
-    // Build smoothed histogram
-    const histSize = Math.ceil(totalExtent);
-    const histogram = new Float64Array(histSize);
-    const sigma = minSeparation * 0.3;
-    const kernelRadius = Math.ceil(sigma * 3);
-
-    for (const pos of positions) {
-      const bin = Math.round(pos);
-      for (let d = -kernelRadius; d <= kernelRadius; d++) {
-        const b = bin + d;
-        if (b >= 0 && b < histSize) {
-          histogram[b] += Math.exp((-0.5 * d * d) / (sigma * sigma));
-        }
-      }
-    }
-
-    // Find all local maxima
-    const peaks: { pos: number; value: number }[] = [];
-    for (let i = 1; i < histSize - 1; i++) {
-      if (
-        histogram[i] > histogram[i - 1] &&
-        histogram[i] >= histogram[i + 1] &&
-        histogram[i] > 0.01
-      ) {
-        peaks.push({ pos: i, value: histogram[i] });
-      }
-    }
-
-    // Sort by strength (strongest first)
-    peaks.sort((a, b) => b.value - a.value);
-
-    // Non-maximum suppression with minimum separation
-    const selected: number[] = [];
-    for (const peak of peaks) {
-      if (
-        selected.every((s) => Math.abs(s - peak.pos) >= minSeparation * 0.5)
-      ) {
-        selected.push(peak.pos);
-        if (selected.length >= numExpected) break;
-      }
-    }
-
-    selected.sort((a, b) => a - b);
-
-    // Interpolate any missing positions
-    if (selected.length < numExpected) {
-      return this.interpolateMissingPositions(
-        selected,
-        numExpected,
-        totalExtent,
-      );
-    }
-
-    return selected;
-  }
-
-  private interpolateMissingPositions(
-    detected: number[],
-    numExpected: number,
-    totalExtent: number,
-  ): number[] {
-    if (detected.length === 0) {
-      const spacing = totalExtent / numExpected;
-      return Array.from({ length: numExpected }, (_, i) => (i + 0.5) * spacing);
-    }
-
-    const expectedSpacing = totalExtent / numExpected;
-
-    // Assign each detected position to the nearest expected grid index
-    const indexMap = new Map<number, number>();
-    for (const pos of detected) {
-      const approxIdx = Math.round(pos / expectedSpacing - 0.5);
-      const idx = Math.max(0, Math.min(numExpected - 1, approxIdx));
-      const expected = (idx + 0.5) * expectedSpacing;
-      const existing = indexMap.get(idx);
-      if (
-        existing === undefined ||
-        Math.abs(pos - expected) < Math.abs(existing - expected)
-      ) {
-        indexMap.set(idx, pos);
-      }
-    }
-
-    // Build full array, interpolating gaps from nearest known positions
-    const result: number[] = [];
-    for (let i = 0; i < numExpected; i++) {
-      const known = indexMap.get(i);
-      if (known !== undefined) {
-        result.push(known);
-      } else {
-        let prevIdx = -1;
-        let nextIdx = -1;
-        for (let j = i - 1; j >= 0; j--) {
-          if (indexMap.has(j)) {
-            prevIdx = j;
-            break;
-          }
-        }
-        for (let j = i + 1; j < numExpected; j++) {
-          if (indexMap.has(j)) {
-            nextIdx = j;
-            break;
-          }
-        }
-
-        if (prevIdx >= 0 && nextIdx >= 0) {
-          const prevPos = indexMap.get(prevIdx)!;
-          const nextPos = indexMap.get(nextIdx)!;
-          const t = (i - prevIdx) / (nextIdx - prevIdx);
-          result.push(prevPos + t * (nextPos - prevPos));
-        } else if (prevIdx >= 0) {
-          const prevPos = indexMap.get(prevIdx)!;
-          result.push(prevPos + (i - prevIdx) * expectedSpacing);
-        } else if (nextIdx >= 0) {
-          const nextPos = indexMap.get(nextIdx)!;
-          result.push(nextPos - (nextIdx - i) * expectedSpacing);
-        } else {
-          result.push((i + 0.5) * expectedSpacing);
-        }
-      }
-    }
-
-    return result;
-  }
-
-  private assignBlobsToGrid(
-    blobs: DetectedBlob[],
-    rowPositions: number[],
-    colPositions: number[],
-  ): boolean[][] {
-    const outH = this.state.outputHeight;
-    const outW = this.state.outputWidth;
-
-    const cellStates: boolean[][] = Array(outH)
-      .fill(null)
-      .map(() => Array(outW).fill(false));
-
-    const avgColSpacing =
-      colPositions.length > 1
-        ? (colPositions[colPositions.length - 1] - colPositions[0]) /
-          (colPositions.length - 1)
-        : 1;
-    const avgRowSpacing =
-      rowPositions.length > 1
-        ? (rowPositions[rowPositions.length - 1] - rowPositions[0]) /
-          (rowPositions.length - 1)
-        : 1;
-
-    for (const blob of blobs) {
-      let bestRow = 0;
-      let bestRowDist = Infinity;
-      for (let r = 0; r < rowPositions.length; r++) {
-        const dist = Math.abs(blob.centerY - rowPositions[r]);
-        if (dist < bestRowDist) {
-          bestRowDist = dist;
-          bestRow = r;
-        }
-      }
-
-      let bestCol = 0;
-      let bestColDist = Infinity;
-      for (let c = 0; c < colPositions.length; c++) {
-        const dist = Math.abs(blob.centerX - colPositions[c]);
-        if (dist < bestColDist) {
-          bestColDist = dist;
-          bestCol = c;
-        }
-      }
-
-      if (
-        bestColDist < avgColSpacing * 0.6 &&
-        bestRowDist < avgRowSpacing * 0.6
-      ) {
-        cellStates[bestRow][bestCol] = true;
-      }
-    }
-
-    return cellStates;
-  }
+  // Grid fitting methods (findPeaks, interpolateMissingPositions, assignBlobsToGrid)
+  // removed - will be re-implemented with a different approach
 
   // --- Auto-Detect Orchestration ---
 
@@ -1343,38 +1145,13 @@ class PunchcardDigitizer {
     // Step 4: Filter blobs by size and shape
     const blobs = this.filterBlobs(allBlobs, cellPx);
 
-    // Step 5: Find row and column positions via histogram peaks
-    const colPositions = this.findPeaks(
-      blobs.map((b) => b.centerX),
-      rectified.width,
-      this.state.outputWidth,
-      cellPx * 0.7,
-    );
-    const rowPositions = this.findPeaks(
-      blobs.map((b) => b.centerY),
-      rectified.height,
-      this.state.outputHeight,
-      cellPx * 0.7,
-    );
-
-    // Step 6: Assign blobs to grid cells
-    this.state.cellStates = this.assignBlobsToGrid(
-      blobs,
-      rowPositions,
-      colPositions,
-    );
-    this.state.showGrid = true;
-
-    // Store blobs and detected grid positions for visualization
+    // Store blobs for visualization
     this.detectedBlobs = blobs;
     this.rectifiedCellPx = cellPx;
-    this.detectedColPositions = colPositions.map((p) => p / cellPx);
-    this.detectedRowPositions = rowPositions.map((p) => p / cellPx);
 
     this.invalidateInputCache();
-    this.outputCacheDirty = true;
     console.log(
-      `Auto-detect: ${(performance.now() - t0).toFixed(1)}ms - ${allBlobs.length} raw blobs, ${blobs.length} filtered, ${colPositions.length} cols, ${rowPositions.length} rows`,
+      `Auto-detect: ${(performance.now() - t0).toFixed(1)}ms - ${allBlobs.length} raw blobs, ${blobs.length} filtered`,
     );
     this.render();
   };
@@ -1557,147 +1334,36 @@ class PunchcardDigitizer {
       ctx.fillStyle = "rgba(59, 130, 246, 0.1)";
       ctx.fill();
 
-      // Draw grid if enabled
-      if (this.state.showGrid) {
-        const gridSteps = 15;
-        const hasPeaks =
-          this.detectedColPositions.length > 0 &&
-          this.detectedRowPositions.length > 0;
-
-        // Draw centerlines through detected peak positions (or boundary grid as fallback)
-        ctx.strokeStyle = hasPeaks
-          ? "rgba(59, 130, 246, 0.7)"
-          : "rgba(0, 0, 0, 0.85)";
-        ctx.lineWidth = hasPeaks ? 1 : 0.5;
-        ctx.beginPath();
-
-        if (hasPeaks) {
-          // Vertical centerlines through detected column positions
-          for (const colPos of this.detectedColPositions) {
-            for (let s = 0; s <= gridSteps; s++) {
-              const row = (s / gridSteps) * this.state.outputHeight;
-              const pt = this.transformPoint(colPos, row);
-              if (pt) {
-                if (s === 0) ctx.moveTo(pt.x, pt.y);
-                else ctx.lineTo(pt.x, pt.y);
-              }
-            }
-          }
-
-          // Horizontal centerlines through detected row positions
-          for (const rowPos of this.detectedRowPositions) {
-            for (let s = 0; s <= gridSteps; s++) {
-              const col = (s / gridSteps) * this.state.outputWidth;
-              const pt = this.transformPoint(col, rowPos);
-              if (pt) {
-                if (s === 0) ctx.moveTo(pt.x, pt.y);
-                else ctx.lineTo(pt.x, pt.y);
-              }
-            }
-          }
-        } else {
-          // Fallback: boundary grid lines
-          for (let col = 0; col <= this.state.outputWidth; col++) {
-            for (let s = 0; s <= gridSteps; s++) {
-              const row = (s / gridSteps) * this.state.outputHeight;
-              const pt = this.transformPoint(col, row);
-              if (pt) {
-                if (s === 0) ctx.moveTo(pt.x, pt.y);
-                else ctx.lineTo(pt.x, pt.y);
-              }
-            }
-          }
-          for (let row = 0; row <= this.state.outputHeight; row++) {
-            for (let s = 0; s <= gridSteps; s++) {
-              const col = (s / gridSteps) * this.state.outputWidth;
-              const pt = this.transformPoint(col, row);
-              if (pt) {
-                if (s === 0) ctx.moveTo(pt.x, pt.y);
-                else ctx.lineTo(pt.x, pt.y);
-              }
-            }
-          }
-        }
-
-        ctx.stroke();
-
-        // Compute cell boundary positions from detected peaks (midpoints between
-        // adjacent centers), or fall back to integer boundaries
-        const colBounds: number[] = [];
-        const rowBounds: number[] = [];
-        if (hasPeaks) {
-          const cp = this.detectedColPositions;
-          const rp = this.detectedRowPositions;
-          // Left boundary: extrapolate half a cell before first center
-          colBounds.push(
-            cp.length > 1
-              ? cp[0] - (cp[1] - cp[0]) / 2
-              : cp[0] - 0.5,
-          );
-          for (let i = 0; i < cp.length - 1; i++) {
-            colBounds.push((cp[i] + cp[i + 1]) / 2);
-          }
-          colBounds.push(
-            cp.length > 1
-              ? cp[cp.length - 1] + (cp[cp.length - 1] - cp[cp.length - 2]) / 2
-              : cp[cp.length - 1] + 0.5,
-          );
-          // Top boundary: extrapolate half a cell before first center
-          rowBounds.push(
-            rp.length > 1
-              ? rp[0] - (rp[1] - rp[0]) / 2
-              : rp[0] - 0.5,
-          );
-          for (let i = 0; i < rp.length - 1; i++) {
-            rowBounds.push((rp[i] + rp[i + 1]) / 2);
-          }
-          rowBounds.push(
-            rp.length > 1
-              ? rp[rp.length - 1] + (rp[rp.length - 1] - rp[rp.length - 2]) / 2
-              : rp[rp.length - 1] + 0.5,
-          );
-        } else {
-          for (let i = 0; i <= this.state.outputWidth; i++) colBounds.push(i);
-          for (let i = 0; i <= this.state.outputHeight; i++) rowBounds.push(i);
-        }
-
-        // Draw all marked cells in a single path using computed boundaries
-        ctx.fillStyle = "rgba(239, 68, 68, 0.5)";
-        ctx.beginPath();
-        const numRows = hasPeaks ? this.detectedRowPositions.length : this.state.outputHeight;
-        const numCols = hasPeaks ? this.detectedColPositions.length : this.state.outputWidth;
-        for (let row = 0; row < numRows; row++) {
-          for (let col = 0; col < numCols; col++) {
-            if (this.state.cellStates[row]?.[col]) {
-              const c0 = this.transformPoint(colBounds[col], rowBounds[row]);
-              const c1 = this.transformPoint(colBounds[col + 1], rowBounds[row]);
-              const c2 = this.transformPoint(colBounds[col + 1], rowBounds[row + 1]);
-              const c3 = this.transformPoint(colBounds[col], rowBounds[row + 1]);
-              if (c0 && c1 && c2 && c3) {
-                ctx.moveTo(c0.x, c0.y);
-                ctx.lineTo(c1.x, c1.y);
-                ctx.lineTo(c2.x, c2.y);
-                ctx.lineTo(c3.x, c3.y);
-                ctx.closePath();
-              }
-            }
-          }
-        }
-        ctx.fill();
-      }
-
-      // Draw detected blob centers as small green dots
+      // Highlight detected blobs
       if (this.detectedBlobs.length > 0 && this.rectifiedCellPx > 0) {
-        ctx.fillStyle = "rgba(34, 197, 94, 0.8)";
-        ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
+        const cellPx = this.rectifiedCellPx;
+
+        // Draw blob outlines as filled ellipses
+        ctx.fillStyle = "rgba(59, 130, 246, 0.35)";
+        ctx.strokeStyle = "rgba(59, 130, 246, 0.9)";
         ctx.lineWidth = 1.5;
         for (const blob of this.detectedBlobs) {
-          const gridCol = blob.centerX / this.rectifiedCellPx;
-          const gridRow = blob.centerY / this.rectifiedCellPx;
+          const gridCol = blob.centerX / cellPx;
+          const gridRow = blob.centerY / cellPx;
           const pt = this.transformPoint(gridCol, gridRow);
           if (pt) {
+            const rx = ((blob.maxX - blob.minX) / 2 / cellPx) *
+              (this.state.corners
+                ? Math.hypot(
+                    this.state.corners[1].x - this.state.corners[0].x,
+                    this.state.corners[1].y - this.state.corners[0].y,
+                  ) / this.state.outputWidth
+                : 1);
+            const ry = ((blob.maxY - blob.minY) / 2 / cellPx) *
+              (this.state.corners
+                ? Math.hypot(
+                    this.state.corners[3].x - this.state.corners[0].x,
+                    this.state.corners[3].y - this.state.corners[0].y,
+                  ) / this.state.outputHeight
+                : 1);
+            const r = Math.max(3, (rx + ry) / 2);
             ctx.beginPath();
-            ctx.arc(pt.x, pt.y, 4, 0, Math.PI * 2);
+            ctx.arc(pt.x, pt.y, r, 0, Math.PI * 2);
             ctx.fill();
             ctx.stroke();
           }
@@ -1850,72 +1516,7 @@ class PunchcardDigitizer {
       this.ctx.stroke();
     }
 
-    // Draw grid lines in the preview if grid is active
-    if (this.state.showGrid) {
-      const gridLineWidth = Math.max(1, zoomSize * 0.003);
-      const gridSteps = 10;
-      const hasPeaks =
-        this.detectedColPositions.length > 0 &&
-        this.detectedRowPositions.length > 0;
-
-      this.ctx.strokeStyle = hasPeaks
-        ? "rgba(59, 130, 246, 0.5)"
-        : "rgba(148, 163, 184, 0.7)";
-      this.ctx.lineWidth = hasPeaks ? gridLineWidth * 2 : gridLineWidth;
-
-      this.ctx.beginPath();
-      if (hasPeaks) {
-        // Vertical centerlines through detected column positions
-        for (const colPos of this.detectedColPositions) {
-          for (let s = 0; s <= gridSteps; s++) {
-            const row = (s / gridSteps) * this.state.outputHeight;
-            const pt = this.transformPoint(colPos, row);
-            if (pt) {
-              const pp = toPreview(pt);
-              if (s === 0) this.ctx.moveTo(pp.x, pp.y);
-              else this.ctx.lineTo(pp.x, pp.y);
-            }
-          }
-        }
-        // Horizontal centerlines through detected row positions
-        for (const rowPos of this.detectedRowPositions) {
-          for (let s = 0; s <= gridSteps; s++) {
-            const col = (s / gridSteps) * this.state.outputWidth;
-            const pt = this.transformPoint(col, rowPos);
-            if (pt) {
-              const pp = toPreview(pt);
-              if (s === 0) this.ctx.moveTo(pp.x, pp.y);
-              else this.ctx.lineTo(pp.x, pp.y);
-            }
-          }
-        }
-      } else {
-        // Fallback: boundary grid lines
-        for (let col = 0; col <= this.state.outputWidth; col++) {
-          for (let s = 0; s <= gridSteps; s++) {
-            const row = (s / gridSteps) * this.state.outputHeight;
-            const pt = this.transformPoint(col, row);
-            if (pt) {
-              const pp = toPreview(pt);
-              if (s === 0) this.ctx.moveTo(pp.x, pp.y);
-              else this.ctx.lineTo(pp.x, pp.y);
-            }
-          }
-        }
-        for (let row = 0; row <= this.state.outputHeight; row++) {
-          for (let s = 0; s <= gridSteps; s++) {
-            const col = (s / gridSteps) * this.state.outputWidth;
-            const pt = this.transformPoint(col, row);
-            if (pt) {
-              const pp = toPreview(pt);
-              if (s === 0) this.ctx.moveTo(pp.x, pp.y);
-              else this.ctx.lineTo(pp.x, pp.y);
-            }
-          }
-        }
-      }
-      this.ctx.stroke();
-    }
+    // Grid drawing removed - only blob detection for now
 
     // Draw a dot at the point being dragged
     const dotRadius = Math.max(5, zoomSize * 0.015);
@@ -2250,8 +1851,6 @@ class PunchcardDigitizer {
                               this.state.showGrid = false;
                               this.state.cellStates = [];
                               this.detectedBlobs = [];
-                              this.detectedColPositions = [];
-                              this.detectedRowPositions = [];
                               this.render();
                             }}
                             ?disabled=${!this.state.corners}
@@ -2336,8 +1935,6 @@ class PunchcardDigitizer {
                               if (this.state.corners) {
                                 this.reinitMidpoints();
                                 this.detectedBlobs = [];
-                                this.detectedColPositions = [];
-                                this.detectedRowPositions = [];
                                 this.invalidateCaches();
                                 this.render();
                               }
@@ -2347,18 +1944,18 @@ class PunchcardDigitizer {
                       </div>
                       <div>
                         <label
-                          class="block text-xs font-medium ${this.state.corners && this.state.showGrid ? "text-gray-700" : "text-gray-400"} mb-1">
+                          class="block text-xs font-medium ${this.state.corners ? "text-gray-700" : "text-gray-400"} mb-1">
                           Sensitivity:
                           ${this.state.detectionSensitivity}
                         </label>
                         <div class="flex items-center gap-2">
-                          <span class="text-xs ${this.state.corners && this.state.showGrid ? "text-gray-500" : "text-gray-300"}">Low</span>
+                          <span class="text-xs ${this.state.corners ? "text-gray-500" : "text-gray-300"}">Low</span>
                           <input
                             type="range"
                             min="0"
                             max="100"
                             .value=${this.state.detectionSensitivity.toString()}
-                            ?disabled=${!(this.state.corners && this.state.showGrid)}
+                            ?disabled=${!(this.state.corners)}
                             @input=${(e: Event) => {
                               this.state.detectionSensitivity = parseInt(
                                 (e.target as HTMLInputElement).value,
@@ -2375,23 +1972,23 @@ class PunchcardDigitizer {
                               );
                             }}
                             class="flex-1 h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-blue-600 disabled:opacity-40 disabled:cursor-not-allowed" />
-                          <span class="text-xs ${this.state.corners && this.state.showGrid ? "text-gray-500" : "text-gray-300"}">High</span>
+                          <span class="text-xs ${this.state.corners ? "text-gray-500" : "text-gray-300"}">High</span>
                         </div>
                       </div>
                       <div class="mt-1">
                         <label
-                          class="block text-xs font-medium ${this.state.corners && this.state.showGrid ? "text-gray-700" : "text-gray-400"} mb-1">
+                          class="block text-xs font-medium ${this.state.corners ? "text-gray-700" : "text-gray-400"} mb-1">
                           Neighborhood:
                           ${this.state.neighborhoodRadius * 2 + 1}×${this.state.neighborhoodRadius * 2 + 1}
                         </label>
                         <div class="flex items-center gap-2">
-                          <span class="text-xs ${this.state.corners && this.state.showGrid ? "text-gray-500" : "text-gray-300"}">Local</span>
+                          <span class="text-xs ${this.state.corners ? "text-gray-500" : "text-gray-300"}">Local</span>
                           <input
                             type="range"
                             min="1"
                             max="20"
                             .value=${this.state.neighborhoodRadius.toString()}
-                            ?disabled=${!(this.state.corners && this.state.showGrid)}
+                            ?disabled=${!(this.state.corners)}
                             @input=${(e: Event) => {
                               this.state.neighborhoodRadius = parseInt(
                                 (e.target as HTMLInputElement).value,
@@ -2408,23 +2005,23 @@ class PunchcardDigitizer {
                               );
                             }}
                             class="flex-1 h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-blue-600 disabled:opacity-40 disabled:cursor-not-allowed" />
-                          <span class="text-xs ${this.state.corners && this.state.showGrid ? "text-gray-500" : "text-gray-300"}">Broad</span>
+                          <span class="text-xs ${this.state.corners ? "text-gray-500" : "text-gray-300"}">Broad</span>
                         </div>
                       </div>
                       <div class="mt-1">
                         <label
-                          class="block text-xs font-medium ${this.state.corners && this.state.showGrid ? "text-gray-700" : "text-gray-400"} mb-1">
+                          class="block text-xs font-medium ${this.state.corners ? "text-gray-700" : "text-gray-400"} mb-1">
                           Punch Size:
                           ${this.state.blobSizePercent}%
                         </label>
                         <div class="flex items-center gap-2">
-                          <span class="text-xs ${this.state.corners && this.state.showGrid ? "text-gray-500" : "text-gray-300"}">Small</span>
+                          <span class="text-xs ${this.state.corners ? "text-gray-500" : "text-gray-300"}">Small</span>
                           <input
                             type="range"
                             min="5"
                             max="100"
                             .value=${this.state.blobSizePercent.toString()}
-                            ?disabled=${!(this.state.corners && this.state.showGrid)}
+                            ?disabled=${!(this.state.corners)}
                             @input=${(e: Event) => {
                               this.state.blobSizePercent = parseInt(
                                 (e.target as HTMLInputElement).value,
@@ -2441,7 +2038,7 @@ class PunchcardDigitizer {
                               );
                             }}
                             class="flex-1 h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-blue-600 disabled:opacity-40 disabled:cursor-not-allowed" />
-                          <span class="text-xs ${this.state.corners && this.state.showGrid ? "text-gray-500" : "text-gray-300"}">Large</span>
+                          <span class="text-xs ${this.state.corners ? "text-gray-500" : "text-gray-300"}">Large</span>
                         </div>
                       </div>
                     </div>
