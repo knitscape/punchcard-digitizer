@@ -18,13 +18,14 @@ interface AppState {
   cellStates: boolean[][];
   showGrid: boolean;
   detectionThreshold: number; // 0-255, pixels darker than this are considered punches
+  hoveredCell: { row: number; col: number } | null;
 }
 
 class PunchcardDigitizer {
   private state: AppState = {
     uploadedImage: null,
-    outputWidth: 24,
-    outputHeight: 52,
+    outputWidth: 72,
+    outputHeight: 95,
     selectionBox: null,
     corners: null,
     isDragging: false,
@@ -33,15 +34,48 @@ class PunchcardDigitizer {
     cellStates: [],
     showGrid: false,
     detectionThreshold: 128,
+    hoveredCell: null,
   };
 
   private canvas: HTMLCanvasElement | null = null;
   private ctx: CanvasRenderingContext2D | null = null;
   private outputCanvas: HTMLCanvasElement | null = null;
   private outputCtx: CanvasRenderingContext2D | null = null;
+  private pendingHoverFrame: number | null = null;
+  private thresholdDebounceTimer: number | null = null;
+
+  // Offscreen caches for the expensive static layers
+  private inputCacheCanvas: HTMLCanvasElement | null = null;
+  private inputCacheCtx: CanvasRenderingContext2D | null = null;
+  private inputCacheDirty: boolean = true;
+  private outputCacheCanvas: HTMLCanvasElement | null = null;
+  private outputCacheCtx: CanvasRenderingContext2D | null = null;
+  private outputCacheDirty: boolean = true;
+  private outputCacheCellSize: number = 0;
+
+  // Cached pixel data for the selection region (avoids repeated getImageData)
+  private selectionPixelData: Uint8ClampedArray | null = null;
+  private selectionBounds: {
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+  } | null = null;
+  private selectionPixelsDirty: boolean = true;
 
   constructor(private container: HTMLElement) {
     this.render();
+  }
+
+  private invalidateInputCache() {
+    this.inputCacheDirty = true;
+    this.selectionPixelsDirty = true;
+  }
+
+  private invalidateCaches() {
+    this.inputCacheDirty = true;
+    this.outputCacheDirty = true;
+    this.selectionPixelsDirty = true;
   }
 
   private handleImageUpload = (e: Event) => {
@@ -132,20 +166,47 @@ class PunchcardDigitizer {
         x: coords.x,
         y: coords.y,
       };
+      this.invalidateInputCache();
       this.drawCanvas();
       return;
     }
 
     // Handle selection box dragging
-    if (!this.state.isDragging || !this.state.dragStart) return;
+    if (this.state.isDragging && this.state.dragStart) {
+      const x = Math.min(this.state.dragStart.x, coords.x);
+      const y = Math.min(this.state.dragStart.y, coords.y);
+      const width = Math.abs(coords.x - this.state.dragStart.x);
+      const height = Math.abs(coords.y - this.state.dragStart.y);
 
-    const x = Math.min(this.state.dragStart.x, coords.x);
-    const y = Math.min(this.state.dragStart.y, coords.y);
-    const width = Math.abs(coords.x - this.state.dragStart.x);
-    const height = Math.abs(coords.y - this.state.dragStart.y);
+      this.state.selectionBox = { x, y, width, height };
+      this.drawCanvas();
+      return;
+    }
 
-    this.state.selectionBox = { x, y, width, height };
-    this.drawCanvas();
+    // Update hovered cell if grid is showing (debounced via rAF)
+    if (this.state.showGrid && this.state.corners) {
+      const cellClicked = this.getCellAtPoint(coords.x, coords.y);
+      const newHoveredCell = cellClicked;
+
+      // Only redraw if hover state changed
+      if (
+        (this.state.hoveredCell === null && newHoveredCell !== null) ||
+        (this.state.hoveredCell !== null && newHoveredCell === null) ||
+        (this.state.hoveredCell !== null &&
+          newHoveredCell !== null &&
+          (this.state.hoveredCell.row !== newHoveredCell.row ||
+            this.state.hoveredCell.col !== newHoveredCell.col))
+      ) {
+        this.state.hoveredCell = newHoveredCell;
+        if (this.pendingHoverFrame === null) {
+          this.pendingHoverFrame = requestAnimationFrame(() => {
+            this.pendingHoverFrame = null;
+            this.drawCanvas();
+            this.drawOutputCanvas();
+          });
+        }
+      }
+    }
   };
 
   private handleMouseUp = () => {
@@ -181,6 +242,74 @@ class PunchcardDigitizer {
         ];
         this.render();
       }
+    }
+  };
+
+  private handleMouseLeave = () => {
+    this.handleMouseUp();
+    // Clear hover state
+    if (this.state.hoveredCell !== null) {
+      this.state.hoveredCell = null;
+      this.drawCanvas();
+      this.drawOutputCanvas();
+    }
+  };
+
+  private getOutputCellAtCoords(
+    e: MouseEvent,
+  ): { row: number; col: number } | null {
+    if (!this.outputCanvas || this.outputCacheCellSize === 0) return null;
+    const rect = this.outputCanvas.getBoundingClientRect();
+    const scaleX = this.outputCanvas.width / rect.width;
+    const scaleY = this.outputCanvas.height / rect.height;
+    const x = (e.clientX - rect.left) * scaleX;
+    const y = (e.clientY - rect.top) * scaleY;
+    const col = Math.floor(x / this.outputCacheCellSize);
+    const row = Math.floor(y / this.outputCacheCellSize);
+    if (
+      col >= 0 &&
+      col < this.state.outputWidth &&
+      row >= 0 &&
+      row < this.state.outputHeight
+    ) {
+      return { row, col };
+    }
+    return null;
+  }
+
+  private handleOutputMouseDown = (e: MouseEvent) => {
+    const cell = this.getOutputCellAtCoords(e);
+    if (cell) {
+      this.toggleCell(cell.col, cell.row);
+    }
+  };
+
+  private handleOutputMouseMove = (e: MouseEvent) => {
+    const cell = this.getOutputCellAtCoords(e);
+    if (
+      (this.state.hoveredCell === null && cell !== null) ||
+      (this.state.hoveredCell !== null && cell === null) ||
+      (this.state.hoveredCell !== null &&
+        cell !== null &&
+        (this.state.hoveredCell.row !== cell.row ||
+          this.state.hoveredCell.col !== cell.col))
+    ) {
+      this.state.hoveredCell = cell;
+      if (this.pendingHoverFrame === null) {
+        this.pendingHoverFrame = requestAnimationFrame(() => {
+          this.pendingHoverFrame = null;
+          this.drawCanvas();
+          this.drawOutputCanvas();
+        });
+      }
+    }
+  };
+
+  private handleOutputMouseLeave = () => {
+    if (this.state.hoveredCell !== null) {
+      this.state.hoveredCell = null;
+      this.drawCanvas();
+      this.drawOutputCanvas();
     }
   };
 
@@ -227,6 +356,7 @@ class PunchcardDigitizer {
   private toggleCell(col: number, row: number) {
     if (!this.state.cellStates[row]) return;
     this.state.cellStates[row][col] = !this.state.cellStates[row][col];
+    this.invalidateCaches();
     this.drawCanvas();
     this.drawOutputCanvas();
   }
@@ -306,10 +436,10 @@ class PunchcardDigitizer {
 
       u += du_step * 0.5;
       v += dv_step * 0.5;
-
-      u = Math.max(0, Math.min(1, u));
-      v = Math.max(0, Math.min(1, v));
     }
+
+    // If the point is outside the quadrilateral, return null
+    if (u < -0.001 || u > 1.001 || v < -0.001 || v > 1.001) return null;
 
     return {
       x: u * this.state.outputWidth,
@@ -317,13 +447,49 @@ class PunchcardDigitizer {
     };
   }
 
+  private rebuildSelectionPixelData() {
+    if (!this.state.uploadedImage || !this.state.corners || !this.canvas)
+      return;
+
+    const [tl, tr, br, bl] = this.state.corners;
+
+    // Compute bounding box of the 4 corners (clamped to canvas)
+    const minX = Math.max(0, Math.floor(Math.min(tl.x, tr.x, br.x, bl.x)));
+    const minY = Math.max(0, Math.floor(Math.min(tl.y, tr.y, br.y, bl.y)));
+    const maxX = Math.min(
+      this.canvas.width,
+      Math.ceil(Math.max(tl.x, tr.x, br.x, bl.x)),
+    );
+    const maxY = Math.min(
+      this.canvas.height,
+      Math.ceil(Math.max(tl.y, tr.y, br.y, bl.y)),
+    );
+    const w = maxX - minX;
+    const h = maxY - minY;
+
+    if (w <= 0 || h <= 0) return;
+
+    // Render the original image to a temp canvas and extract just the selection region
+    const tempCanvas = document.createElement("canvas");
+    tempCanvas.width = this.canvas.width;
+    tempCanvas.height = this.canvas.height;
+    const tempCtx = tempCanvas.getContext("2d")!;
+    tempCtx.drawImage(
+      this.state.uploadedImage,
+      0,
+      0,
+      tempCanvas.width,
+      tempCanvas.height,
+    );
+
+    this.selectionPixelData = tempCtx.getImageData(minX, minY, w, h).data;
+    this.selectionBounds = { x: minX, y: minY, w, h };
+    this.selectionPixelsDirty = false;
+  }
+
   private autoDetect = () => {
-    if (
-      !this.state.uploadedImage ||
-      !this.state.corners ||
-      !this.canvas ||
-      !this.ctx
-    )
+    const t0 = performance.now();
+    if (!this.state.uploadedImage || !this.state.corners || !this.canvas)
       return;
 
     // Initialize grid if not already done
@@ -334,205 +500,135 @@ class PunchcardDigitizer {
         .map(() => Array(this.state.outputWidth).fill(false));
     }
 
-    // Get full canvas image data
-    const fullImageData = this.ctx.getImageData(
-      0,
-      0,
-      this.canvas.width,
-      this.canvas.height,
-    );
-    const data = fullImageData.data;
+    // Rebuild cached pixel data if needed (only when image/corners change)
+    if (
+      this.selectionPixelsDirty ||
+      !this.selectionPixelData ||
+      !this.selectionBounds
+    ) {
+      this.rebuildSelectionPixelData();
+    }
+    if (!this.selectionPixelData || !this.selectionBounds) return;
 
-    // Analyze each cell using perspective transform
-    for (let row = 0; row < this.state.outputHeight; row++) {
-      for (let col = 0; col < this.state.outputWidth; col++) {
+    const data = this.selectionPixelData;
+    const bounds = this.selectionBounds;
+    const boundsX = bounds.x;
+    const boundsY = bounds.y;
+    const boundsW = bounds.w;
+    const boundsH = bounds.h;
+
+    // Pre-extract corner coordinates
+    const [tl, tr, br, bl] = this.state.corners;
+    const tlx = tl.x,
+      tly = tl.y;
+    const trx = tr.x,
+      try_ = tr.y;
+    const brx = br.x,
+      bry = br.y;
+    const blx = bl.x,
+      bly = bl.y;
+
+    const outW = this.state.outputWidth;
+    const outH = this.state.outputHeight;
+    const threshold = this.state.detectionThreshold;
+    const samples = 8;
+    const invSamples = 1 / samples;
+
+    // Analyze each cell using inlined bilinear interpolation
+    for (let row = 0; row < outH; row++) {
+      for (let col = 0; col < outW; col++) {
         let totalLightness = 0;
         let pixelCount = 0;
 
-        // Sample multiple points within the cell
-        const samples = 5;
         for (let sy = 0; sy < samples; sy++) {
+          const v = (row + (sy + 0.5) * invSamples) / outH;
+          const oneMinusV = 1 - v;
+          const leftX = oneMinusV * tlx + v * blx;
+          const rightX = oneMinusV * trx + v * brx;
+          const leftY = oneMinusV * tly + v * bly;
+          const rightY = oneMinusV * try_ + v * bry;
+
           for (let sx = 0; sx < samples; sx++) {
-            const u = col + (sx + 0.5) / samples;
-            const v = row + (sy + 0.5) / samples;
+            const u = (col + (sx + 0.5) * invSamples) / outW;
+            const oneMinusU = 1 - u;
 
-            const point = this.transformPoint(u, v);
-            if (!point) continue;
+            // Map to pixel coords, then offset into the cached selection region
+            const px = Math.floor(oneMinusU * leftX + u * rightX) - boundsX;
+            const py = Math.floor(oneMinusU * leftY + u * rightY) - boundsY;
 
-            const px = Math.floor(point.x);
-            const py = Math.floor(point.y);
-
-            if (
-              px >= 0 &&
-              px < this.canvas.width &&
-              py >= 0 &&
-              py < this.canvas.height
-            ) {
-              const idx = (py * this.canvas.width + px) * 4;
-              const r = data[idx];
-              const g = data[idx + 1];
-              const b = data[idx + 2];
-              const lightness = (r + g + b) / 3;
-              totalLightness += lightness;
+            if (px >= 0 && px < boundsW && py >= 0 && py < boundsH) {
+              const idx = (py * boundsW + px) * 4;
+              totalLightness += data[idx] + data[idx + 1] + data[idx + 2];
               pixelCount++;
             }
           }
         }
 
         if (pixelCount > 0) {
-          const avgLightness = totalLightness / pixelCount;
-          // If dark (punch is black), mark as true based on threshold
-          this.state.cellStates[row][col] = avgLightness < this.state.detectionThreshold;
+          this.state.cellStates[row][col] =
+            totalLightness / (pixelCount * 3) < threshold;
         }
       }
     }
 
+    this.invalidateInputCache();
+    this.outputCacheDirty = true;
+    console.log(
+      `Auto-detect: ${(performance.now() - t0).toFixed(1)}ms (${outW}×${outH} grid, ${samples}×${samples} samples)`,
+    );
     this.render();
   };
 
   private drawCanvas() {
     if (!this.canvas || !this.ctx || !this.state.uploadedImage) return;
 
-    // Clear and draw image
+    // Build or reuse the cached static layer (image + grid + marked cells)
+    if (this.inputCacheDirty || !this.inputCacheCanvas) {
+      this.rebuildInputCache();
+    }
+
+    // Composite: blit cache, then draw dynamic overlays on top
     this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
-    this.ctx.drawImage(
-      this.state.uploadedImage,
-      0,
-      0,
-      this.canvas.width,
-      this.canvas.height,
-    );
+    if (this.inputCacheCanvas) {
+      this.ctx.drawImage(this.inputCacheCanvas, 0, 0);
+    }
 
-    // Draw corners and grid if available
+    // Draw dynamic overlays that change frequently
     if (this.state.corners) {
-      const [tl, tr, br, bl] = this.state.corners;
-
-      // Draw border connecting corners with thicker line
-      this.ctx.strokeStyle = "#3b82f6";
-      this.ctx.lineWidth = 3;
-      this.ctx.beginPath();
-      this.ctx.moveTo(tl.x, tl.y);
-      this.ctx.lineTo(tr.x, tr.y);
-      this.ctx.lineTo(br.x, br.y);
-      this.ctx.lineTo(bl.x, bl.y);
-      this.ctx.closePath();
-      this.ctx.stroke();
-
-      // Draw semi-transparent fill to show selected area
-      this.ctx.fillStyle = "rgba(59, 130, 246, 0.1)";
-      this.ctx.fill();
-
-      // Draw perspective-corrected grid if enabled
-      if (this.state.showGrid) {
-        this.ctx.strokeStyle = "#94a3b8";
-        this.ctx.lineWidth = 0.5;
-
-        // Calculate grid step to avoid drawing too many lines
-        const maxGridLines = 20;
-        const colStep = Math.max(
-          1,
-          Math.ceil(this.state.outputWidth / maxGridLines),
-        );
-        const rowStep = Math.max(
-          1,
-          Math.ceil(this.state.outputHeight / maxGridLines),
-        );
-
-        // Draw vertical grid lines (draw every colStep lines)
-        for (let col = 0; col <= this.state.outputWidth; col += colStep) {
+      // Highlight hovered cell
+      if (this.state.hoveredCell !== null && this.state.showGrid) {
+        const { row, col } = this.state.hoveredCell;
+        const c0 = this.transformPoint(col, row);
+        const c1 = this.transformPoint(col + 1, row);
+        const c2 = this.transformPoint(col + 1, row + 1);
+        const c3 = this.transformPoint(col, row + 1);
+        if (c0 && c1 && c2 && c3) {
+          this.ctx.fillStyle = "rgba(59, 130, 246, 0.3)";
           this.ctx.beginPath();
-          const topPoint = this.transformPoint(col, 0);
-          const bottomPoint = this.transformPoint(col, this.state.outputHeight);
-          if (topPoint && bottomPoint) {
-            this.ctx.moveTo(topPoint.x, topPoint.y);
-            this.ctx.lineTo(bottomPoint.x, bottomPoint.y);
-            this.ctx.stroke();
-          }
-        }
-        // Always draw the last vertical line
-        if (this.state.outputWidth % colStep !== 0) {
-          this.ctx.beginPath();
-          const topPoint = this.transformPoint(this.state.outputWidth, 0);
-          const bottomPoint = this.transformPoint(
-            this.state.outputWidth,
-            this.state.outputHeight,
-          );
-          if (topPoint && bottomPoint) {
-            this.ctx.moveTo(topPoint.x, topPoint.y);
-            this.ctx.lineTo(bottomPoint.x, bottomPoint.y);
-            this.ctx.stroke();
-          }
-        }
-
-        // Draw horizontal grid lines (draw every rowStep lines)
-        for (let row = 0; row <= this.state.outputHeight; row += rowStep) {
-          this.ctx.beginPath();
-          const leftPoint = this.transformPoint(0, row);
-          const rightPoint = this.transformPoint(this.state.outputWidth, row);
-          if (leftPoint && rightPoint) {
-            this.ctx.moveTo(leftPoint.x, leftPoint.y);
-            this.ctx.lineTo(rightPoint.x, rightPoint.y);
-            this.ctx.stroke();
-          }
-        }
-        // Always draw the last horizontal line
-        if (this.state.outputHeight % rowStep !== 0) {
-          this.ctx.beginPath();
-          const leftPoint = this.transformPoint(0, this.state.outputHeight);
-          const rightPoint = this.transformPoint(
-            this.state.outputWidth,
-            this.state.outputHeight,
-          );
-          if (leftPoint && rightPoint) {
-            this.ctx.moveTo(leftPoint.x, leftPoint.y);
-            this.ctx.lineTo(rightPoint.x, rightPoint.y);
-            this.ctx.stroke();
-          }
-        }
-
-        // Fill marked cells
-        for (let row = 0; row < this.state.outputHeight; row++) {
-          for (let col = 0; col < this.state.outputWidth; col++) {
-            if (this.state.cellStates[row]?.[col]) {
-              const corners = [
-                this.transformPoint(col, row),
-                this.transformPoint(col + 1, row),
-                this.transformPoint(col + 1, row + 1),
-                this.transformPoint(col, row + 1),
-              ];
-              if (corners.every((c) => c !== null)) {
-                this.ctx.fillStyle = "rgba(239, 68, 68, 0.5)";
-                this.ctx.beginPath();
-                this.ctx.moveTo(corners[0]!.x, corners[0]!.y);
-                this.ctx.lineTo(corners[1]!.x, corners[1]!.y);
-                this.ctx.lineTo(corners[2]!.x, corners[2]!.y);
-                this.ctx.lineTo(corners[3]!.x, corners[3]!.y);
-                this.ctx.closePath();
-                this.ctx.fill();
-              }
-            }
-          }
+          this.ctx.moveTo(c0.x, c0.y);
+          this.ctx.lineTo(c1.x, c1.y);
+          this.ctx.lineTo(c2.x, c2.y);
+          this.ctx.lineTo(c3.x, c3.y);
+          this.ctx.closePath();
+          this.ctx.fill();
+          this.ctx.strokeStyle = "#3b82f6";
+          this.ctx.lineWidth = 2;
+          this.ctx.stroke();
         }
       }
 
-      // Draw corner handles (large for easy clicking)
+      // Draw corner handles (always on top)
       const handleRadius = 30;
       for (let i = 0; i < 4; i++) {
         const corner = this.state.corners[i];
-
-        // Draw outer circle (white border)
         this.ctx.fillStyle = "#ffffff";
         this.ctx.beginPath();
         this.ctx.arc(corner.x, corner.y, handleRadius, 0, Math.PI * 2);
         this.ctx.fill();
-
-        // Draw inner circle (blue)
         this.ctx.fillStyle = "#3b82f6";
         this.ctx.beginPath();
         this.ctx.arc(corner.x, corner.y, handleRadius - 5, 0, Math.PI * 2);
         this.ctx.fill();
-
-        // Draw thick border
         this.ctx.strokeStyle = "#1e40af";
         this.ctx.lineWidth = 5;
         this.ctx.beginPath();
@@ -552,19 +648,145 @@ class PunchcardDigitizer {
     // Draw selection box while dragging (before corners are created)
     if (this.state.isDragging && this.state.selectionBox) {
       const { x, y, width, height } = this.state.selectionBox;
-
-      // Draw semi-transparent fill
       this.ctx.fillStyle = "rgba(59, 130, 246, 0.15)";
       this.ctx.fillRect(x, y, width, height);
-
-      // Draw border
       this.ctx.strokeStyle = "#3b82f6";
       this.ctx.lineWidth = 2;
       this.ctx.strokeRect(x, y, width, height);
     }
+  }
 
-    // Draw output canvas
-    this.drawOutputCanvas();
+  private rebuildInputCache() {
+    if (!this.canvas || !this.state.uploadedImage) return;
+
+    // Create or resize offscreen canvas
+    if (!this.inputCacheCanvas) {
+      this.inputCacheCanvas = document.createElement("canvas");
+      this.inputCacheCtx = this.inputCacheCanvas.getContext("2d");
+    }
+    this.inputCacheCanvas.width = this.canvas.width;
+    this.inputCacheCanvas.height = this.canvas.height;
+    const ctx = this.inputCacheCtx;
+    if (!ctx) return;
+
+    // Draw image
+    ctx.clearRect(
+      0,
+      0,
+      this.inputCacheCanvas.width,
+      this.inputCacheCanvas.height,
+    );
+    ctx.drawImage(
+      this.state.uploadedImage,
+      0,
+      0,
+      this.inputCacheCanvas.width,
+      this.inputCacheCanvas.height,
+    );
+
+    // Draw corners and grid if available
+    if (this.state.corners) {
+      const [tl, tr, br, bl] = this.state.corners;
+
+      // Draw border connecting corners
+      ctx.strokeStyle = "#3b82f6";
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(tl.x, tl.y);
+      ctx.lineTo(tr.x, tr.y);
+      ctx.lineTo(br.x, br.y);
+      ctx.lineTo(bl.x, bl.y);
+      ctx.closePath();
+      ctx.stroke();
+
+      // Draw semi-transparent fill
+      ctx.fillStyle = "rgba(59, 130, 246, 0.1)";
+      ctx.fill();
+
+      // Draw perspective-corrected grid if enabled
+      if (this.state.showGrid) {
+        const maxGridLines = 20;
+        const colStep = Math.max(
+          1,
+          Math.ceil(this.state.outputWidth / maxGridLines),
+        );
+        const rowStep = Math.max(
+          1,
+          Math.ceil(this.state.outputHeight / maxGridLines),
+        );
+
+        // Draw all grid lines in a single path
+        ctx.strokeStyle = "#94a3b8";
+        ctx.lineWidth = 0.5;
+        ctx.beginPath();
+
+        for (let col = 0; col <= this.state.outputWidth; col += colStep) {
+          const topPoint = this.transformPoint(col, 0);
+          const bottomPoint = this.transformPoint(col, this.state.outputHeight);
+          if (topPoint && bottomPoint) {
+            ctx.moveTo(topPoint.x, topPoint.y);
+            ctx.lineTo(bottomPoint.x, bottomPoint.y);
+          }
+        }
+        if (this.state.outputWidth % colStep !== 0) {
+          const topPoint = this.transformPoint(this.state.outputWidth, 0);
+          const bottomPoint = this.transformPoint(
+            this.state.outputWidth,
+            this.state.outputHeight,
+          );
+          if (topPoint && bottomPoint) {
+            ctx.moveTo(topPoint.x, topPoint.y);
+            ctx.lineTo(bottomPoint.x, bottomPoint.y);
+          }
+        }
+
+        for (let row = 0; row <= this.state.outputHeight; row += rowStep) {
+          const leftPoint = this.transformPoint(0, row);
+          const rightPoint = this.transformPoint(this.state.outputWidth, row);
+          if (leftPoint && rightPoint) {
+            ctx.moveTo(leftPoint.x, leftPoint.y);
+            ctx.lineTo(rightPoint.x, rightPoint.y);
+          }
+        }
+        if (this.state.outputHeight % rowStep !== 0) {
+          const leftPoint = this.transformPoint(0, this.state.outputHeight);
+          const rightPoint = this.transformPoint(
+            this.state.outputWidth,
+            this.state.outputHeight,
+          );
+          if (leftPoint && rightPoint) {
+            ctx.moveTo(leftPoint.x, leftPoint.y);
+            ctx.lineTo(rightPoint.x, rightPoint.y);
+          }
+        }
+
+        ctx.stroke();
+
+        // Draw all marked cells in a single path
+        ctx.fillStyle = "rgba(239, 68, 68, 0.5)";
+        ctx.beginPath();
+        for (let row = 0; row < this.state.outputHeight; row++) {
+          for (let col = 0; col < this.state.outputWidth; col++) {
+            if (this.state.cellStates[row]?.[col]) {
+              const c0 = this.transformPoint(col, row);
+              const c1 = this.transformPoint(col + 1, row);
+              const c2 = this.transformPoint(col + 1, row + 1);
+              const c3 = this.transformPoint(col, row + 1);
+              if (c0 && c1 && c2 && c3) {
+                ctx.moveTo(c0.x, c0.y);
+                ctx.lineTo(c1.x, c1.y);
+                ctx.lineTo(c2.x, c2.y);
+                ctx.lineTo(c3.x, c3.y);
+                ctx.closePath();
+              }
+            }
+          }
+        }
+        ctx.fill();
+      }
+    }
+
+    this.inputCacheDirty = false;
   }
 
   private drawZoomPreview(corner: Corner, cornerIndex: number) {
@@ -730,6 +952,58 @@ class PunchcardDigitizer {
     )
       return;
 
+    // Build or reuse the cached output layer
+    if (this.outputCacheDirty || !this.outputCacheCanvas) {
+      this.rebuildOutputCache();
+    }
+
+    if (!this.outputCacheCanvas) return;
+
+    // Resize visible canvas to match cache
+    if (
+      this.outputCanvas.width !== this.outputCacheCanvas.width ||
+      this.outputCanvas.height !== this.outputCacheCanvas.height
+    ) {
+      this.outputCanvas.width = this.outputCacheCanvas.width;
+      this.outputCanvas.height = this.outputCacheCanvas.height;
+    }
+
+    // Blit cache
+    this.outputCtx.drawImage(this.outputCacheCanvas, 0, 0);
+
+    // Draw hover highlight on top and update coordinates display
+    const hoverCoordsEl = document.getElementById("hover-coords");
+    if (this.state.hoveredCell !== null) {
+      const { row, col } = this.state.hoveredCell;
+      const cellSize = this.outputCacheCellSize;
+      this.outputCtx.fillStyle = "rgba(59, 130, 246, 0.4)";
+      this.outputCtx.fillRect(
+        col * cellSize,
+        row * cellSize,
+        cellSize,
+        cellSize,
+      );
+      this.outputCtx.strokeStyle = "#3b82f6";
+      this.outputCtx.lineWidth = 2;
+      this.outputCtx.strokeRect(
+        col * cellSize,
+        row * cellSize,
+        cellSize,
+        cellSize,
+      );
+      if (hoverCoordsEl) {
+        hoverCoordsEl.textContent = `(${col + 1}, ${this.state.outputHeight - row})`;
+      }
+    } else {
+      if (hoverCoordsEl) {
+        hoverCoordsEl.textContent = "";
+      }
+    }
+  }
+
+  private rebuildOutputCache() {
+    if (!this.outputCanvas) return;
+
     // Get the container dimensions to scale appropriately
     const container = this.outputCanvas.parentElement;
     const maxWidth = container ? container.clientWidth - 40 : 400;
@@ -738,50 +1012,67 @@ class PunchcardDigitizer {
     // Calculate cell size to fit within container while maintaining aspect ratio
     const cellSizeByWidth = maxWidth / this.state.outputWidth;
     const cellSizeByHeight = maxHeight / this.state.outputHeight;
-    const cellSize = Math.max(2, Math.floor(Math.min(cellSizeByWidth, cellSizeByHeight)));
-
-    this.outputCanvas.width = this.state.outputWidth * cellSize;
-    this.outputCanvas.height = this.state.outputHeight * cellSize;
-
-    // Clear canvas
-    this.outputCtx.fillStyle = "#ffffff";
-    this.outputCtx.fillRect(
-      0,
-      0,
-      this.outputCanvas.width,
-      this.outputCanvas.height,
+    const cellSize = Math.max(
+      2,
+      Math.floor(Math.min(cellSizeByWidth, cellSizeByHeight)),
     );
+    this.outputCacheCellSize = cellSize;
 
-    // Draw cells
+    const cacheW = this.state.outputWidth * cellSize;
+    const cacheH = this.state.outputHeight * cellSize;
+
+    // Create or resize offscreen canvas
+    if (!this.outputCacheCanvas) {
+      this.outputCacheCanvas = document.createElement("canvas");
+      this.outputCacheCtx = this.outputCacheCanvas.getContext("2d");
+    }
+    this.outputCacheCanvas.width = cacheW;
+    this.outputCacheCanvas.height = cacheH;
+    const ctx = this.outputCacheCtx;
+    if (!ctx) return;
+
+    // White background
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, cacheW, cacheH);
+
+    // Draw all black cells using ImageData for maximum speed
+    const imageData = ctx.getImageData(0, 0, cacheW, cacheH);
+    const pixels = imageData.data;
     for (let row = 0; row < this.state.outputHeight; row++) {
       for (let col = 0; col < this.state.outputWidth; col++) {
         if (this.state.cellStates[row]?.[col]) {
-          this.outputCtx.fillStyle = "#000000";
-          this.outputCtx.fillRect(
-            col * cellSize,
-            row * cellSize,
-            cellSize,
-            cellSize,
-          );
+          const startX = col * cellSize;
+          const startY = row * cellSize;
+          for (let py = startY; py < startY + cellSize; py++) {
+            const rowOffset = py * cacheW * 4;
+            for (let px = startX; px < startX + cellSize; px++) {
+              const idx = rowOffset + px * 4;
+              pixels[idx] = 0; // R
+              pixels[idx + 1] = 0; // G
+              pixels[idx + 2] = 0; // B
+              // Alpha is already 255 from getImageData
+            }
+          }
         }
       }
     }
+    ctx.putImageData(imageData, 0, 0);
 
-    // Draw grid lines
-    this.outputCtx.strokeStyle = "#e5e7eb";
-    this.outputCtx.lineWidth = 1;
+    // Draw grid lines in a single batched path
+    ctx.strokeStyle = "#e5e7eb";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
     for (let row = 0; row <= this.state.outputHeight; row++) {
-      this.outputCtx.beginPath();
-      this.outputCtx.moveTo(0, row * cellSize);
-      this.outputCtx.lineTo(this.state.outputWidth * cellSize, row * cellSize);
-      this.outputCtx.stroke();
+      ctx.moveTo(0, row * cellSize);
+      ctx.lineTo(cacheW, row * cellSize);
     }
     for (let col = 0; col <= this.state.outputWidth; col++) {
-      this.outputCtx.beginPath();
-      this.outputCtx.moveTo(col * cellSize, 0);
-      this.outputCtx.lineTo(col * cellSize, this.state.outputHeight * cellSize);
-      this.outputCtx.stroke();
+      ctx.moveTo(col * cellSize, 0);
+      ctx.lineTo(col * cellSize, cacheH);
     }
+    ctx.stroke();
+
+    this.outputCacheDirty = false;
   }
 
   private exportAsPNG = () => {
@@ -812,6 +1103,8 @@ class PunchcardDigitizer {
   };
 
   private exportAsBMP = () => {
+    if (this.state.cellStates.length === 0) return;
+
     const width = this.state.outputWidth;
     const height = this.state.outputHeight;
 
@@ -849,13 +1142,13 @@ class PunchcardDigitizer {
       for (let col = 0; col < width; col++) {
         const isPunch = this.state.cellStates[row]?.[col];
         const color = isPunch ? 0 : 255; // Black (0) or White (255)
-        
+
         // BMP uses BGR order
         view.setUint8(offset++, color); // B
         view.setUint8(offset++, color); // G
         view.setUint8(offset++, color); // R
       }
-      
+
       // Padding to align to 4-byte boundary
       const bytesInRow = width * 3;
       const padding = rowSize - bytesInRow;
@@ -949,7 +1242,8 @@ class PunchcardDigitizer {
               `
             : html`
                 <!-- Image Loaded State -->
-                <div class="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-4 h-full">
+                <div
+                  class="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-4 h-full">
                   <!-- Input Image (Left) -->
                   <div
                     class="bg-white rounded-lg shadow overflow-hidden flex flex-col">
@@ -1058,8 +1352,10 @@ class PunchcardDigitizer {
                       ${this.state.corners && this.state.showGrid
                         ? html`
                             <div>
-                              <label class="block text-xs font-medium text-gray-700 mb-1">
-                                Detection Threshold: ${this.state.detectionThreshold}
+                              <label
+                                class="block text-xs font-medium text-gray-700 mb-1">
+                                Detection Threshold:
+                                ${this.state.detectionThreshold}
                               </label>
                               <div class="flex items-center gap-2">
                                 <span class="text-xs text-gray-500">Light</span>
@@ -1072,15 +1368,22 @@ class PunchcardDigitizer {
                                     this.state.detectionThreshold = parseInt(
                                       (e.target as HTMLInputElement).value,
                                     );
-                                    // Re-run detection with new threshold
-                                    this.autoDetect();
+                                    // Debounce auto-detect while dragging the slider
+                                    if (this.thresholdDebounceTimer !== null) {
+                                      clearTimeout(this.thresholdDebounceTimer);
+                                    }
+                                    this.thresholdDebounceTimer =
+                                      window.setTimeout(() => {
+                                        this.thresholdDebounceTimer = null;
+                                        this.autoDetect();
+                                      }, 30);
                                   }}
                                   class="flex-1 h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-blue-600" />
                                 <span class="text-xs text-gray-500">Dark</span>
                               </div>
                             </div>
                           `
-                        : ''}
+                        : ""}
                     </div>
                     <div class="p-3 flex-1 overflow-hidden flex flex-col">
                       <div class="flex-1 overflow-auto">
@@ -1089,7 +1392,7 @@ class PunchcardDigitizer {
                           @mousedown=${this.handleMouseDown}
                           @mousemove=${this.handleMouseMove}
                           @mouseup=${this.handleMouseUp}
-                          @mouseleave=${this.handleMouseUp}
+                          @mouseleave=${this.handleMouseLeave}
                           class="max-w-full border border-gray-300 rounded cursor-crosshair"></canvas>
                       </div>
                     </div>
@@ -1108,6 +1411,9 @@ class PunchcardDigitizer {
                           this.state.cellStates.length > 0
                             ? `${this.state.outputWidth} × ${this.state.outputHeight} bitmap`
                             : "Select an area and click Auto-Detect"}
+                          <span
+                            id="hover-coords"
+                            class="ml-2 text-blue-600 font-medium"></span>
                         </p>
                       </div>
                       ${this.state.showGrid && this.state.cellStates.length > 0
@@ -1140,7 +1446,10 @@ class PunchcardDigitizer {
                           ? html`
                               <canvas
                                 id="output-canvas"
-                                class="border border-gray-300 rounded max-w-full max-h-full object-contain"></canvas>
+                                @mousedown=${this.handleOutputMouseDown}
+                                @mousemove=${this.handleOutputMouseMove}
+                                @mouseleave=${this.handleOutputMouseLeave}
+                                class="border border-gray-300 rounded max-w-full max-h-full object-contain cursor-pointer"></canvas>
                             `
                           : html`
                               <div class="text-center text-gray-400 text-sm">
@@ -1185,7 +1494,9 @@ class PunchcardDigitizer {
       this.outputCtx = this.outputCanvas.getContext("2d");
     }
 
+    this.invalidateCaches();
     this.drawCanvas();
+    this.drawOutputCanvas();
   }
 }
 
